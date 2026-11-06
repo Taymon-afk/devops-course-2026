@@ -292,10 +292,238 @@ sudo grep 'UFW BLOCK' /var/log/ufw.log | tail -5
 | 01-clean-install | Ubuntu установлена и обновлена, сеть настроена, выполнен первый SSH-вход |
 | 02-keys-configured | Создан devops с sudo, настроены ключ и команда ssh devops |
 | 03-ssh-hardened | SSH перенесён на 2222, отключён парольный вход и проверены запреты |
+| pr5-before-pr6 | Полная настройка ПР5 перед проверкой восстановления, включая UFW и FQDN |
+| 04-nginx-https | После восстановления ПР5 установлен Nginx, настроены HTTPS и перенаправление с HTTP |
 
 После снимка 03-ssh-hardened дополнительно настроены UFW и доменное имя.
 
 Скрипт проверки хранится в scripts/audit.sh.
-При правильной конфигурации проходят 6 проверок, код возврата равен 0.
+В версии ПР5 при правильной конфигурации проходят 6 проверок, код возврата равен 0.
 При временной замене MaxAuthTries 3 на MaxAuthTries 10 одна проверка завершается ошибкой, код возврата равен 1.
 После проверки значение 3 восстановлено, синтаксис SSH проверен, аудит снова возвращает 0.
+
+## 8. Веб-сервер
+
+### Установка и каталог сайта
+
+На сервере установлены nginx, openssl и rsync:
+
+```bash
+sudo apt update
+sudo apt install -y nginx openssl rsync
+sudo install -d -m 755 -o devops -g devops /var/www/devops-site
+```
+
+Каталог сайта: /var/www/devops-site. Владелец каталога и файлов — devops:devops.
+Права каталогов — 755, файлов — 644. Рабочие процессы Nginx работают от www-data:
+они читают содержимое, но не могут его изменять. Главный процесс работает от root.
+Исходники главной страницы и страницы ошибки находятся в site/index.html и site/404.html.
+
+### Сертификат и закрытый ключ
+
+Самоподписанный сертификат выпускается на 365 дней для имени devops.local.
+Команда для восстановления на чистой машине:
+
+```bash
+sudo openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+  -keyout /etc/ssl/private/devops.key \
+  -out /etc/ssl/certs/devops.crt \
+  -subj "/CN=devops.local" \
+  -addext "subjectAltName=DNS:devops.local"
+sudo chown root:root /etc/ssl/private/devops.key /etc/ssl/certs/devops.crt
+sudo chmod 600 /etc/ssl/private/devops.key
+sudo chmod 644 /etc/ssl/certs/devops.crt
+```
+
+Закрытый ключ остаётся только на сервере и не добавляется в Git.
+Главный процесс Nginx читает его от root; www-data доступа к ключу не имеет.
+Сертификат — открытый файл, его можно скопировать клиенту через проверенное SSH-соединение.
+При замене сертификата ранее скопированную клиентскую копию тоже нужно обновить.
+
+### Конфигурация ресурса
+
+Файл /etc/nginx/sites-available/devops-site:
+
+```nginx
+server {
+    listen 80;
+    listen [::]:80;
+    server_name devops.local;
+
+    access_log /var/log/nginx/devops-site.access.log;
+    return 301 https://$host$request_uri;
+}
+
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    server_name devops.local;
+
+    ssl_certificate /etc/ssl/certs/devops.crt;
+    ssl_certificate_key /etc/ssl/private/devops.key;
+    ssl_protocols TLSv1.2 TLSv1.3;
+
+    root /var/www/devops-site;
+    index index.html;
+
+    location / {
+        try_files $uri $uri/ =404;
+    }
+
+    error_page 404 /404.html;
+    access_log /var/log/nginx/devops-site.access.log;
+    error_log /var/log/nginx/devops-site.error.log;
+}
+```
+
+Активация конфигурации и отключение стандартного ресурса:
+
+```bash
+sudo ln -sfn /etc/nginx/sites-available/devops-site /etc/nginx/sites-enabled/devops-site
+sudo rm -f /etc/nginx/sites-enabled/default
+sudo nginx -t && sudo systemctl enable --now nginx && sudo systemctl reload nginx
+sudo ss -tlnp | grep nginx
+```
+
+Стандартный файл /etc/nginx/sites-available/default сохраняется: удаляется только ссылка.
+Правила UFW для 80/tcp и 443/tcp уже созданы в разделе 6; добавлять дублирующий профиль Nginx Full не нужно.
+Для сайта используется Host-only адрес 192.168.56.101, а не проброс HTTP/HTTPS через NAT.
+HSTS на учебном сайте не включён.
+
+### Клиент Windows и WSL
+
+Для rsync используется Ubuntu в WSL версии 1. Проверка из PowerShell: wsl -l -v.
+Сам веб-сервер работает в VirtualBox, а WSL используется как клиент.
+В WSL установлены git, rsync, curl и openssl. Ключ devops_vm, SSH-конфигурация и known_hosts
+скопированы из C:\Users\Artmb\.ssh в /home/artmb/.ssh.
+Каталог .ssh имеет права 700, закрытый ключ и файл config — 600.
+
+Репозиторий в WSL расположен по пути:
+
+```text
+/mnt/c/Users/Artmb/OneDrive/Рабочий стол/девопс/devops-course-2026
+```
+
+При работе Windows Git и WSL Git с одной папкой применены локальные настройки:
+
+```bash
+git config core.fileMode false
+git config core.autocrlf true
+```
+
+Первая настройка убирает ложные изменения исполняемых битов на /mnt/c,
+вторая согласует обработку CRLF с Windows Git. В .gitattributes для *.sh задано text eol=lf.
+Реальные изменения по-прежнему видны в git status.
+
+Вход и получение сертификата выполняются из WSL:
+
+```bash
+ssh devops
+# После выхода из SSH, в WSL:
+scp devops:/etc/ssl/certs/devops.crt ~/devops.crt
+curl --noproxy devops.local --cacert ~/devops.crt -I https://devops.local/
+```
+
+Файл ~/devops.crt хранится в домашнем каталоге WSL /home/artmb.
+Для локального имени явно используется --noproxy devops.local, поскольку на Windows настроен прокси.
+Проверка с --cacert проходит без -k. Предупреждение браузера о самоподписанном сертификате ожидаемо:
+в curl доверие задано явно, в системное хранилище браузера сертификат не импортировался.
+
+### Доставка содержимого
+
+Первую новую команду синхронизации с --delete проверяют с --dry-run:
+
+```bash
+rsync -avz --delete --chmod=D755,F644 --dry-run site/ devops:/var/www/devops-site/
+rsync -avz --delete --chmod=D755,F644 site/ devops:/var/www/devops-site/
+```
+
+Завершающий / у site/ означает передачу его содержимого.
+Нормализация прав обязательна: на /mnt/c исходные файлы видны с правами 777.
+
+Штатный сценарий — scripts/deploy.sh. Он запускается из любого каталога репозитория,
+проверяет наличие index.html и чистоту рабочей копии, включая индекс и неотслеживаемые файлы.
+За запуск открывается одно SSH-соединение rsync; BatchMode=yes запрещает запрос пароля,
+ConnectTimeout ограничивает ожидание подключения. Затем curl проверяет HTTPS с ~/devops.crt.
+Успех возвращает 0 и короткий хеш коммита, ошибка — 1.
+
+```bash
+scripts/deploy.sh --dry-run
+scripts/deploy.sh
+echo $?
+```
+
+При --dry-run передача и проверка доступности не выполняются: выводится только план rsync.
+Любые изменения самого скрипта и документации тоже надо закоммитить перед штатным деплоем.
+
+Подтверждены пять сценариев:
+
+| Условие | Результат |
+|---|---|
+| --dry-run | План операций, код 0 |
+| Изменение страницы закоммичено | Страница обновлена, код 0; проверен запуск из docs |
+| Изменение не закоммичено | Отказ до передачи, код 1 |
+| Nginx остановлен | Передача выполнена, HTTPS-проверка не пройдена, код 1; служба затем запущена |
+| index.html переименован с коммитом | Отказ до передачи, код 1; имя восстановлено отдельным коммитом |
+
+### Проверка и диагностика
+
+На сервере:
+
+```bash
+sudo nginx -t
+ps -o user,pid,ppid,cmd -C nginx
+namei -l /var/www/devops-site/index.html
+find /var/www/devops-site -perm -o+w
+sudo stat -c '%a %U:%G %n' /etc/ssl/private/devops.key
+sudo tail -n 10 /var/log/nginx/devops-site.access.log
+sudo tail -n 10 /var/log/nginx/devops-site.error.log
+sudo awk '{print $9}' /var/log/nginx/devops-site.access.log | sort | uniq -c | sort -rn
+```
+
+В WSL:
+
+```bash
+curl --noproxy devops.local -I http://devops.local/
+curl --noproxy devops.local --cacert ~/devops.crt -I https://devops.local/
+curl --noproxy devops.local --cacert ~/devops.crt -I https://devops.local/no-such-page
+openssl s_client -connect devops.local:443 -servername devops.local </dev/null 2>/dev/null \
+  | openssl x509 -noout -subject -issuer -dates -ext subjectAltName
+```
+
+Ожидаемые ответы: HTTP — 301 с Location на HTTPS, главная по HTTPS — 200, неизвестная страница — 404.
+Журнал запросов задаётся и для HTTP-блока, поэтому перенаправления тоже попадают в журнал сайта.
+В успешной проверке использовался TLS 1.3, поле SAN содержало DNS:devops.local.
+
+При правах index.html 600 получен 403 и open() ... failed (13: Permission denied).
+Для каталога проверены 755 → 200, 750 → 403, 744 → 403, 711 → 200.
+При недостатке прав на каталоге в error.log записано is forbidden (13: Permission denied).
+У каталога 711 есть проход x, но нет чтения списка r; у 744 список виден, но прохода нет.
+
+Доставка без --chmod перенесла права 777: www-data смог подменить index.html.
+Штатный deploy.sh восстановил содержимое и права; find после восстановления ничего не вывел,
+попытка touch от www-data завершилась Permission denied.
+
+### Расширенный аудит
+
+В scripts/audit.sh добавлен раздел [4] Веб-сервер: состояние Nginx, синтаксис конфигурации,
+оставшийся срок сертификата и совместная проверка прав сайта и ключа.
+Для ключа проверяются права 600 и владелец root; файлов и каталогов с записью для всех быть не должно.
+Всего проходят 10 проверок, итоговый код — 0.
+
+На сервере проверен порог 400 дней при сертификате на 365 дней:
+
+```bash
+CERT_MIN_DAYS=400 bash ~/pr5/scripts/audit.sh
+echo $?
+```
+
+Ожидается одна ошибка и код 1. Изменяется только порог проверки, сертификат не перевыпускается.
+Также проверено временное chmod 666 для index.html: одна ошибка, код 1.
+Права восстановлены в 644, после чего снова получены 10 успешных проверок и код 0.
+
+Рабочая серверная копия аудита — ~/pr5/scripts/audit.sh. При изменении репозиторной версии обновить её из WSL:
+
+```bash
+scp scripts/audit.sh devops:pr5/scripts/audit.sh
+```
