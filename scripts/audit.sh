@@ -75,6 +75,21 @@ fi
 
 check "Нет записи для всех, ключ имеет права 600 и владельца root" \
     "yes" "$permissions_ok"
+echo "[5] Контейнеризация"
 
+check "Docker активен" "yes" \
+    "$(result systemctl is-active --quiet docker)"
+
+db_health=$(docker inspect -f '{{.State.Health.Status}}' app-db-1 2>/dev/null || true)
+check "База данных healthy" "healthy" "$db_health"
+
+ports_ok=$(ss -tln | awk '
+    $4 ~ /:(5000|5432)$/ && $4 !~ /^127\.0\.0\.1:/ {bad=1}
+    END {print bad ? "no" : "yes"}
+')
+check "Порты контейнеров закрыты для внешней сети" "yes" "$ports_ok"
+
+env_mode=$(stat -c '%a' "$HOME/app/.env" 2>/dev/null || true)
+check "Права файла .env равны 600" "600" "$env_mode"
 echo "Пройдено: $PASS, не пройдено: $FAIL"
 [[ $FAIL -eq 0 ]] && exit 0 || exit 1
